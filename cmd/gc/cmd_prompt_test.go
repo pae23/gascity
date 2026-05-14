@@ -479,7 +479,7 @@ func TestLoadBaselinePromptUserCustomizationWins(t *testing.T) {
 		t.Fatalf("write pack prompt: %v", err)
 	}
 
-	body, source, own := loadBaselinePrompt(cityDir, "polecat")
+	body, source, own := loadBaselinePrompt(cityDir, "polecat", "")
 	if body != "USER VERSION" {
 		t.Errorf("user customization should win, got %q", body)
 	}
@@ -501,7 +501,7 @@ func TestLoadBaselinePromptFallsBackToPackDefault(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	body, source, own := loadBaselinePrompt(cityDir, "witness")
+	body, source, own := loadBaselinePrompt(cityDir, "witness", "")
 	if body != "PACK VERSION" {
 		t.Errorf("pack default should be used, got %q", body)
 	}
@@ -516,7 +516,7 @@ func TestLoadBaselinePromptFallsBackToPackDefault(t *testing.T) {
 func TestLoadBaselinePromptUsesEmbeddedMayorForKnownRole(t *testing.T) {
 	// "mayor" exists as embed; should be returned as own baseline.
 	cityDir := t.TempDir() // empty city, no overrides
-	body, source, own := loadBaselinePrompt(cityDir, "mayor")
+	body, source, own := loadBaselinePrompt(cityDir, "mayor", "")
 	if body == "" {
 		t.Fatalf("embedded mayor.md should be available as baseline")
 	}
@@ -532,7 +532,7 @@ func TestLoadBaselinePromptFallsBackToMayorAsStructuralReference(t *testing.T) {
 	// Unknown role with no overrides — should fall back to mayor.md as
 	// structural reference, marked NOT own.
 	cityDir := t.TempDir()
-	body, source, own := loadBaselinePrompt(cityDir, "totally-novel-role")
+	body, source, own := loadBaselinePrompt(cityDir, "totally-novel-role", "")
 	if body == "" {
 		t.Fatalf("expected mayor.md fallback to be present")
 	}
@@ -995,6 +995,316 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// --- --pack flag (write into a user-defined pack instead of city/agents) ---
+
+// writeCityPack seeds a minimal pack at <cityDir>/packs/<name>/pack.toml so
+// validatePack accepts it.
+func writeCityPack(t *testing.T, cityDir, packName string) string {
+	t.Helper()
+	packDir := filepath.Join(cityDir, "packs", packName)
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatalf("mkdir pack dir: %v", err)
+	}
+	body := "[pack]\nname = \"" + packName + "\"\nschema = 1\n"
+	if err := os.WriteFile(filepath.Join(packDir, "pack.toml"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write pack.toml: %v", err)
+	}
+	return packDir
+}
+
+func TestRunPromptSynthRejectsInvalidPackName(t *testing.T) {
+	cityDir := writeMinimalCity(t, "claude")
+	for _, pack := range []string{
+		"../escape",
+		"foo/bar",
+		"foo/../bar",
+		".hidden",
+		"-leading-dash",
+		"UPPERCASE",
+		"foo bar",
+	} {
+		t.Run(pack, func(t *testing.T) {
+			runner := &fakeSynthRunner{body: "ignored"}
+			var stdout, stderr bytes.Buffer
+			err := runPromptSynth(context.Background(), promptSynthOpts{
+				role:     "mayor",
+				provider: "claude",
+				pack:     pack,
+				city:     cityDir,
+			}, runner.run, &stdout, &stderr)
+			if err == nil || !strings.Contains(err.Error(), "invalid --pack") {
+				t.Errorf("pack=%q: expected invalid-pack error, got %v", pack, err)
+			}
+			if runner.gotCalled {
+				t.Errorf("pack=%q: runner should not be called for invalid pack", pack)
+			}
+		})
+	}
+}
+
+func TestRunPromptSynthRejectsMissingPack(t *testing.T) {
+	cityDir := writeMinimalCity(t, "claude")
+	runner := &fakeSynthRunner{body: "ignored"}
+	var stdout, stderr bytes.Buffer
+	err := runPromptSynth(context.Background(), promptSynthOpts{
+		role:     "mayor",
+		provider: "claude",
+		pack:     "missing-pack",
+		city:     cityDir,
+	}, runner.run, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "pack") || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected pack-not-found error, got %v", err)
+	}
+	if runner.gotCalled {
+		t.Errorf("runner should not be called when pack is missing")
+	}
+}
+
+func TestRunPromptSynthAcceptsValidPackWithPackToml(t *testing.T) {
+	cityDir := writeMinimalCity(t, "claude")
+	writeCityPack(t, cityDir, "chat")
+	runner := &fakeSynthRunner{body: "# generated"}
+	var stdout, stderr bytes.Buffer
+	err := runPromptSynth(context.Background(), promptSynthOpts{
+		role:     "chat-claude",
+		provider: "claude",
+		pack:     "chat",
+		city:     cityDir,
+	}, runner.run, &stdout, &stderr)
+	if err != nil {
+		t.Errorf("expected success with valid pack, got %v\nstderr=%s", err, stderr.String())
+	}
+	if !runner.gotCalled {
+		t.Errorf("runner should be called when pack validation succeeds")
+	}
+}
+
+func TestLoadBaselinePromptPackCustomizationWinsWhenPackSet(t *testing.T) {
+	cityDir := t.TempDir()
+	// City customization (would normally win without --pack).
+	cityAgentDir := filepath.Join(cityDir, "agents", "polecat")
+	if err := os.MkdirAll(cityAgentDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cityAgentDir, "prompt.template.md"), []byte("CITY VERSION"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Pack customization (should win when pack is set).
+	packAgentDir := filepath.Join(cityDir, "packs", "chat", "agents", "polecat")
+	if err := os.MkdirAll(packAgentDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packAgentDir, "prompt.template.md"), []byte("PACK VERSION"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	body, source, own := loadBaselinePrompt(cityDir, "polecat", "chat")
+	if body != "PACK VERSION" {
+		t.Errorf("pack baseline should win when --pack is set, got %q", body)
+	}
+	if !strings.Contains(source, "pack \"chat\"") {
+		t.Errorf("source should mention pack name, got %q", source)
+	}
+	if !own {
+		t.Errorf("pack baseline is role-specific, expected own=true")
+	}
+}
+
+func TestLoadBaselinePromptFallsBackWhenPackHasNoBaseline(t *testing.T) {
+	cityDir := t.TempDir()
+	// City customization exists; pack has no agents/<role>/ entry.
+	cityAgentDir := filepath.Join(cityDir, "agents", "polecat")
+	if err := os.MkdirAll(cityAgentDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cityAgentDir, "prompt.template.md"), []byte("CITY VERSION"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	body, source, own := loadBaselinePrompt(cityDir, "polecat", "chat")
+	if body != "CITY VERSION" {
+		t.Errorf("should fall back to city baseline when pack has no role file, got %q", body)
+	}
+	if !strings.Contains(source, "city customization") {
+		t.Errorf("source should describe city customization, got %q", source)
+	}
+	if !own {
+		t.Errorf("city baseline is role-specific, expected own=true")
+	}
+}
+
+func TestRunPromptSynthWritePackCreatesFileAtPackPath(t *testing.T) {
+	cityDir := writeMinimalCity(t, "claude")
+	writeCityPack(t, cityDir, "chat")
+	runner := &fakeSynthRunner{body: "# Chat Claude\n\nbody."}
+	var stdout, stderr bytes.Buffer
+	err := runPromptSynth(context.Background(), promptSynthOpts{
+		role:     "chat-claude",
+		provider: "claude",
+		pack:     "chat",
+		write:    true,
+		city:     cityDir,
+	}, runner.run, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runPromptSynth: %v\nstderr=%s", err, stderr.String())
+	}
+	dst := filepath.Join(cityDir, "packs", "chat", "agents", "chat-claude", "prompt.template.md")
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read written file at expected pack path: %v", err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "# Chat Claude") {
+		t.Errorf("written file missing body, got\n%s", got)
+	}
+	// Make sure the city-level agents/<role>/ was NOT created.
+	cityDst := filepath.Join(cityDir, "agents", "chat-claude", "prompt.template.md")
+	if _, err := os.Stat(cityDst); err == nil {
+		t.Errorf("--pack must not write to city-level agents/<role>/, but %s exists", cityDst)
+	}
+}
+
+func TestRunPromptSynthWritePackHeaderMentionsPack(t *testing.T) {
+	cityDir := writeMinimalCity(t, "claude")
+	writeCityPack(t, cityDir, "chat")
+	runner := &fakeSynthRunner{body: "body"}
+	var stdout, stderr bytes.Buffer
+	err := runPromptSynth(context.Background(), promptSynthOpts{
+		role:     "chat-claude",
+		provider: "claude",
+		pack:     "chat",
+		write:    true,
+		city:     cityDir,
+	}, runner.run, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runPromptSynth: %v", err)
+	}
+	dst := filepath.Join(cityDir, "packs", "chat", "agents", "chat-claude", "prompt.template.md")
+	data, _ := os.ReadFile(dst)
+	if !strings.Contains(string(data), "pack:") || !strings.Contains(string(data), "chat") {
+		t.Errorf("header should record pack name, got\n%s", data)
+	}
+}
+
+func TestRunPromptSynthPackWriteRefusesToClobberWithoutForce(t *testing.T) {
+	cityDir := writeMinimalCity(t, "claude")
+	writeCityPack(t, cityDir, "chat")
+	dst := filepath.Join(cityDir, "packs", "chat", "agents", "chat-claude", "prompt.template.md")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(dst, []byte("ORIGINAL"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	runner := &fakeSynthRunner{body: "REPLACEMENT"}
+	var stdout, stderr bytes.Buffer
+	err := runPromptSynth(context.Background(), promptSynthOpts{
+		role:     "chat-claude",
+		provider: "claude",
+		pack:     "chat",
+		write:    true,
+		city:     cityDir,
+	}, runner.run, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "exists") {
+		t.Errorf("expected refuse-to-clobber error, got %v", err)
+	}
+	got, _ := os.ReadFile(dst)
+	if string(got) != "ORIGINAL" {
+		t.Errorf("file should be unchanged, got %q", got)
+	}
+}
+
+func TestRunPromptSynthRejectsPackRigConflictWhenRigDoesntImport(t *testing.T) {
+	rigPath := t.TempDir()
+	cityDir := writeMinimalCity(t, "claude", config.Rig{
+		Name:          "myrig",
+		Path:          rigPath,
+		DefaultBranch: "main",
+	})
+	writeCityPack(t, cityDir, "chat")
+	runner := &fakeSynthRunner{body: "ignored"}
+	var stdout, stderr bytes.Buffer
+	err := runPromptSynth(context.Background(), promptSynthOpts{
+		role:     "chat-claude",
+		provider: "claude",
+		pack:     "chat",
+		rig:      "myrig",
+		city:     cityDir,
+	}, runner.run, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "rig") || !strings.Contains(err.Error(), "import") {
+		t.Errorf("expected rig-doesn't-import-pack error, got %v", err)
+	}
+	if runner.gotCalled {
+		t.Errorf("runner should not be called when rig/pack mismatch")
+	}
+}
+
+func TestRunPromptSynthAcceptsPackRigWhenRigImportsByPath(t *testing.T) {
+	rigPath := t.TempDir()
+	cityDir := t.TempDir()
+	// city.toml with a rig that imports ./packs/chat by source path.
+	tomlBody := "[workspace]\nname = \"test-city\"\nprovider = \"claude\"\n\n" +
+		"[[rigs]]\nname = \"myrig\"\npath = \"" + rigPath + "\"\ndefault_branch = \"main\"\n\n" +
+		"[rigs.imports.chat]\nsource = \"./packs/chat\"\n"
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(tomlBody), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	writeCityPack(t, cityDir, "chat")
+	runner := &fakeSynthRunner{body: "# gen"}
+	var stdout, stderr bytes.Buffer
+	err := runPromptSynth(context.Background(), promptSynthOpts{
+		role:     "chat-claude",
+		provider: "claude",
+		pack:     "chat",
+		rig:      "myrig",
+		city:     cityDir,
+	}, runner.run, &stdout, &stderr)
+	if err != nil {
+		t.Errorf("expected success when rig imports pack by source path, got %v\nstderr=%s", err, stderr.String())
+	}
+	if !runner.gotCalled {
+		t.Errorf("runner should be called when rig imports pack")
+	}
+}
+
+func TestRunSlinguedSynthPackTargetsPackPath(t *testing.T) {
+	cityDir := writeCityWithAgent(t, "claude", "mayor")
+	writeCityPack(t, cityDir, "chat")
+	store := beads.NewMemStore()
+	slinger := &fakeSlinger{}
+	deps := slinguedSynthDeps{
+		storeOpener: func(string) (beads.Store, error) { return store, nil },
+		slingCaller: slinger.call,
+		now:         time.Now,
+		waitTick:    10 * time.Millisecond,
+	}
+	cfg, err := loadCityConfig(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("loadCityConfig: %v", err)
+	}
+	mctx := metaPromptCtx{
+		Role:        "chat-claude",
+		ContextType: "city",
+		CityName:    "test-city",
+		CityPath:    cityDir,
+		Pack:        "chat",
+	}
+	var stdout, stderr bytes.Buffer
+	err = runSlinguedSynthWithDeps(context.Background(),
+		promptSynthOpts{role: "chat-claude", writerAgent: "mayor", pack: "chat", city: cityDir},
+		cfg, cityDir, "chat-claude", "rendered", mctx, deps, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runSlinguedSynth: %v\nstderr=%s", err, stderr.String())
+	}
+	beadsList, _ := store.ListOpen()
+	if len(beadsList) != 1 {
+		t.Fatalf("expected 1 bead, got %d", len(beadsList))
+	}
+	wantDest := filepath.Join(cityDir, "packs", "chat", "agents", "chat-claude", "prompt.template.md")
+	if beadsList[0].Metadata["synth_dest"] != wantDest {
+		t.Errorf("synth_dest = %q, want %q", beadsList[0].Metadata["synth_dest"], wantDest)
+	}
 }
 
 // --- additional slingued-mode coverage (commit e68ff9ff hardening) ---

@@ -26,6 +26,11 @@ import (
 // hidden directories, or path separators.
 var validRoleName = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
+// validPackName guards `--pack`: lowercase alphanumeric, dashes, and
+// underscores; must start with a letter. Mirrors validRoleName but allows
+// underscores since pack names already accept them in TOML import keys.
+var validPackName = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
+
 // synthTimeout caps the LLM subprocess for `gc prompt synth`. Generation
 // can be slow (large outputs, slow models) but should never block forever.
 const synthTimeout = 5 * time.Minute
@@ -40,6 +45,7 @@ type promptSynthOpts struct {
 	role               string
 	provider           string
 	rig                string
+	pack               string
 	writerAgent        string
 	write              bool
 	force              bool
@@ -71,6 +77,12 @@ type metaPromptCtx struct {
 	RigName          string
 	RigPath          string
 	RigDefaultBranch string
+
+	// Pack is set when --pack is passed: it routes the write target to
+	// <CityPath>/packs/<Pack>/agents/<Role>/prompt.template.md and
+	// promotes the pack-local baseline above city/agents in the
+	// resolution order. Empty means city-level write (the default).
+	Pack string
 
 	// Baseline carries the existing prompt content (if any) for the
 	// LLM to refine rather than design from scratch. BaselineSource
@@ -114,7 +126,9 @@ provider in one-shot mode, and emits the generated prompt template.
 
 The default behavior prints the generated prompt to stdout. Pass --write
 to save it directly to <city>/agents/<role>/prompt.template.md (use --force
-to overwrite an existing file).
+to overwrite an existing file). Pass --pack <name> to write into a
+user-defined pack at <city>/packs/<name>/agents/<role>/ instead — useful
+for keeping role-generic agents opt-in per rig via [rigs.imports.<name>].
 
 Context type is determined by --rig:
 
@@ -133,6 +147,8 @@ Baseline:
   The synth pulls in an existing prompt template as a refinement
   baseline so the LLM iterates on a known-good shape rather than
   designing from scratch. Resolution priority:
+    0. <city>/packs/<pack>/agents/<role>/          (only with --pack;
+                                                     pack customization)
     1. <city>/agents/<role>/prompt.template.md     (user customization)
     2. <city>/.gc/system/packs/*/agents/<role>/    (pack default)
     3. embedded prompts/<role>.md                  (built-in fallback)
@@ -178,10 +194,11 @@ date for traceability.`,
 	cmd.Flags().StringVar(&opts.role, "role", "", "agent role to design (required, e.g. mayor, polecat, witness)")
 	cmd.Flags().StringVar(&opts.provider, "provider", "", "target AI provider key (default: city.toml workspace.provider)")
 	cmd.Flags().StringVar(&opts.rig, "rig", "", "rig name from city.toml (default: empty = city/HQ context, no rig)")
+	cmd.Flags().StringVar(&opts.pack, "pack", "", "user-defined pack at <city>/packs/<name>/ to write into instead of <city>/agents/")
 	cmd.Flags().StringVar(&opts.writerAgent, "writer-agent", "", "Gas City agent to delegate the synth to via mol-prompt-synth (default: empty = direct mode, no agent)")
 	cmd.Flags().BoolVar(&opts.wait, "wait", false, "in slingued mode, block until the agent closes the bead")
 	cmd.Flags().DurationVar(&opts.waitTimeout, "wait-timeout", 10*time.Minute, "in slingued mode with --wait, abort after this duration")
-	cmd.Flags().BoolVar(&opts.write, "write", false, "write to <city>/agents/<role>/prompt.template.md instead of stdout (direct mode only; slingued mode always writes)")
+	cmd.Flags().BoolVar(&opts.write, "write", false, "write to <city>/agents/<role>/prompt.template.md instead of stdout (direct mode only; slingued mode always writes); pair with --pack to write under <city>/packs/<pack>/agents/<role>/ instead")
 	cmd.Flags().BoolVar(&opts.force, "force", false, "with --write, overwrite the destination if it exists")
 	cmd.Flags().StringVar(&opts.city, "city", "", "city path (default: auto-resolve)")
 	cmd.Flags().StringVar(&opts.metaPromptOverride, "meta-prompt", "", "override the embedded meta-prompt with a file path")
@@ -209,6 +226,25 @@ func runPromptSynth(ctx context.Context, opts promptSynthOpts, runner promptSynt
 	}
 	if providerKey == "" {
 		return errors.New("no provider specified and city.toml has no workspace.provider; pass --provider")
+	}
+
+	pack := strings.TrimSpace(opts.pack)
+	if pack != "" {
+		if !validPackName.MatchString(pack) {
+			return fmt.Errorf("invalid --pack %q: must match %s (lowercase alphanumeric + dashes/underscores, starts with a letter)", pack, validPackName.String())
+		}
+		if _, err := validatePackExists(cityPath, pack); err != nil {
+			return err
+		}
+		if rigName := strings.TrimSpace(opts.rig); rigName != "" {
+			rig := findRigByName(rigName, cfg.Rigs)
+			if rig == nil {
+				return fmt.Errorf("rig %q not found in city.toml; known: %s", rigName, knownRigNames(cfg.Rigs))
+			}
+			if !rigImportsPack(rig, cityPath, pack) {
+				return fmt.Errorf("rig %q does not import pack %q (no [rigs.imports.*] or includes entry resolves to packs/%s); add an import or omit --rig", rigName, pack, pack)
+			}
+		}
 	}
 
 	mctx, err := buildMetaPromptCtx(opts, cfg, cityPath, role, providerKey)
@@ -247,6 +283,7 @@ func buildMetaPromptCtx(opts promptSynthOpts, cfg *config.City, cityPath, role, 
 		ProviderDisplayName: providerDisplayNameFor(providerKey, cfg.Providers),
 		CityName:            strings.TrimSpace(cfg.Workspace.Name),
 		CityPath:            cityPath,
+		Pack:                strings.TrimSpace(opts.pack),
 	}
 	if mctx.CityName == "" {
 		mctx.CityName = filepath.Base(cityPath)
@@ -263,7 +300,7 @@ func buildMetaPromptCtx(opts promptSynthOpts, cfg *config.City, cityPath, role, 
 	} else {
 		mctx.ContextType = "city"
 	}
-	mctx.Baseline, mctx.BaselineSource, mctx.HasOwnBaseline = loadBaselinePrompt(cityPath, role)
+	mctx.Baseline, mctx.BaselineSource, mctx.HasOwnBaseline = loadBaselinePrompt(cityPath, role, mctx.Pack)
 	return mctx, nil
 }
 
@@ -381,7 +418,7 @@ func runSlinguedSynthWithDeps(ctx context.Context, opts promptSynthOpts, cfg *co
 		return fmt.Errorf("writer-agent %q not found in city.toml; known: %s", writerAgent, knownAgentNames(cfg.Agents))
 	}
 
-	destPath := filepath.Join(cityPath, "agents", role, "prompt.template.md")
+	destPath := promptOutputDest(cityPath, role, mctx.Pack)
 	if !opts.force {
 		if _, err := os.Stat(destPath); err == nil {
 			return fmt.Errorf("destination %s exists; pass --force to overwrite (slingued mode always writes)", destPath)
@@ -525,12 +562,15 @@ func renderMetaPrompt(source string, ctx metaPromptCtx) (string, error) {
 	return buf.String(), nil
 }
 
-// writePromptOutput writes body to <cityPath>/agents/<role>/prompt.template.md.
-// When force is false and the destination exists, returns an error rather
-// than clobbering. Prepends a comment header recording the synth inputs
-// (role, provider, context type, baseline source) for traceability.
+// writePromptOutput writes body to the resolved destination
+// (<cityPath>/agents/<role>/prompt.template.md by default;
+// <cityPath>/packs/<pack>/agents/<role>/prompt.template.md when
+// mctx.Pack is set). When force is false and the destination exists,
+// returns an error rather than clobbering. Prepends a comment header
+// recording the synth inputs (role, provider, context type, baseline
+// source, pack) for traceability.
 func writePromptOutput(cityPath, role string, force bool, mctx metaPromptCtx, body string) (string, error) {
-	dst := filepath.Join(cityPath, "agents", role, "prompt.template.md")
+	dst := promptOutputDest(cityPath, role, mctx.Pack)
 	if !force {
 		if _, err := os.Stat(dst); err == nil {
 			return "", fmt.Errorf("destination %s exists; pass --force to overwrite", dst)
@@ -547,20 +587,34 @@ func writePromptOutput(cityPath, role string, force bool, mctx metaPromptCtx, bo
 	if mctx.BaselineSource != "" {
 		baselineLine = mctx.BaselineSource
 	}
+	packLine := ""
+	if mctx.Pack != "" {
+		packLine = fmt.Sprintf("  pack:     %s\n", mctx.Pack)
+	}
 	header := fmt.Sprintf(`<!--
 Generated by `+"`"+`gc prompt synth`+"`"+` on %s.
   role:     %s
   provider: %s (%s)
   context:  %s
-  baseline: %s
+%s  baseline: %s
 LLM-generated content. Review carefully before relying on it.
 -->
 
-`, time.Now().UTC().Format("2006-01-02"), role, mctx.ProviderKey, mctx.ProviderDisplayName, contextLine, baselineLine)
+`, time.Now().UTC().Format("2006-01-02"), role, mctx.ProviderKey, mctx.ProviderDisplayName, contextLine, packLine, baselineLine)
 	if err := os.WriteFile(dst, []byte(header+body+"\n"), 0o644); err != nil {
 		return "", err
 	}
 	return dst, nil
+}
+
+// promptOutputDest returns the absolute destination path for synth output.
+// When pack is non-empty, writes route to the pack's agents/ tree; otherwise
+// to the city-level agents/ tree.
+func promptOutputDest(cityPath, role, pack string) string {
+	if pack != "" {
+		return filepath.Join(cityPath, "packs", pack, "agents", role, "prompt.template.md")
+	}
+	return filepath.Join(cityPath, "agents", role, "prompt.template.md")
 }
 
 // findRigByName returns the matching rig (by Name) from the configured
@@ -593,14 +647,30 @@ func knownRigNames(rigs []config.Rig) string {
 // flag indicating whether the baseline is role-specific (vs a
 // structural reference borrowed from another role).
 //
+// When pack is non-empty, the pack-local location at
+// <cityPath>/packs/<pack>/agents/<role>/prompt.template.md is checked
+// FIRST so iterative `--pack` synth runs refine the pack's existing
+// template rather than the unrelated city/agents copy.
+//
 // Resolution priority:
+//  0. <cityPath>/packs/<pack>/agents/<role>/prompt.template.md (only when
+//     pack != ""; pack customization)
 //  1. <cityPath>/agents/<role>/prompt.template.md (user customization)
 //  2. <cityPath>/.gc/system/packs/<any>/agents/<role>/prompt.template.md (pack default)
 //  3. embedded prompts/<role>.md (built-in fallback, only mayor today)
 //  4. embedded prompts/mayor.md (structural reference, last resort)
-func loadBaselinePrompt(cityPath, role string) (content, source string, ownToRole bool) {
+func loadBaselinePrompt(cityPath, role, pack string) (content, source string, ownToRole bool) {
 	if role == "" {
 		return "", "", false
+	}
+
+	// 0. Pack customization (only when --pack is set).
+	if pack != "" {
+		packFile := filepath.Join(cityPath, "packs", pack, "agents", role, "prompt.template.md")
+		if data, err := os.ReadFile(packFile); err == nil {
+			rel, _ := filepath.Rel(cityPath, packFile)
+			return string(data), fmt.Sprintf("pack %q customization at %s", pack, rel), true
+		}
 	}
 
 	// 1. User customization in the city.
@@ -635,6 +705,60 @@ func loadBaselinePrompt(cityPath, role string) (content, source string, ownToRol
 	}
 
 	return "", "", false
+}
+
+// validatePackExists confirms a user-defined pack lives at
+// <cityPath>/packs/<name>/pack.toml and returns its absolute root path.
+// Callers are expected to have validated <name> against validPackName
+// first; this function only performs the filesystem existence check.
+func validatePackExists(cityPath, packName string) (string, error) {
+	packRoot := filepath.Join(cityPath, "packs", packName)
+	packToml := filepath.Join(packRoot, "pack.toml")
+	if _, err := os.Stat(packToml); err != nil {
+		return "", fmt.Errorf("pack %q not found at %s (expected pack.toml)", packName, packToml)
+	}
+	return packRoot, nil
+}
+
+// rigImportsPack reports whether the rig has any V1 include or V2
+// rigs.imports entry whose source path resolves to <cityPath>/packs/<pack>.
+// Remote sources (https://, github.com/, git@) cannot reference a
+// city-local pack and are therefore skipped.
+func rigImportsPack(rig *config.Rig, cityPath, packName string) bool {
+	if rig == nil || packName == "" {
+		return false
+	}
+	target := filepath.Clean(filepath.Join(cityPath, "packs", packName))
+	for _, imp := range rig.Imports {
+		if importSourceMatchesLocalPath(imp.Source, cityPath, target) {
+			return true
+		}
+	}
+	for _, inc := range rig.Includes {
+		if importSourceMatchesLocalPath(inc, cityPath, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// importSourceMatchesLocalPath returns true when source resolves
+// (relative to cityPath when not absolute) to the same directory as
+// target. Remote-looking sources (URLs, git@ shorthand, or sources with
+// a "//subpath#ref" marker) cannot match a local pack and are skipped.
+func importSourceMatchesLocalPath(source, cityPath, target string) bool {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return false
+	}
+	if strings.Contains(source, "://") || strings.HasPrefix(source, "git@") || strings.HasPrefix(source, "github.com/") || strings.Contains(source, "//") {
+		return false
+	}
+	p := source
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(cityPath, p)
+	}
+	return filepath.Clean(p) == target
 }
 
 // defaultPromptSynthRunner runs the configured provider one-shot via
