@@ -2136,9 +2136,15 @@ op_init() {
 
     # If already initialized on disk and the server has a bd schema, ensure the
     # database is also registered with the running server. Local metadata can be
-    # written before bd init seeds tables, so require the server-side schema
-    # before taking the fast path.
-    if [ -f "$dir/.beads/metadata.json" ]; then
+    # written before bd init seeds tables (gc's normalizeCanonicalBdScopeFilesForInit
+    # writes metadata.json with dolt_database/dolt_mode BEFORE invoking us), so
+    # the bare `[ -f metadata.json ]` check cannot distinguish "fully initialized"
+    # from "gc-pre-seeded but bd init never ran". Gate the fast path on the
+    # presence of project_id, which is only ever written by a successful bd init —
+    # its absence means a previous attempt aborted mid-way OR this is a truly
+    # fresh init that gc pre-seeded. In both cases, fall through to the
+    # full bd init path rather than mistakenly skipping it. (gascity-3 RC2.)
+    if metadata_has_project_id "$dir/.beads/metadata.json"; then
         if ensure_database_registered "$dolt_database"; then
             if bd_runtime_schema_ready "$dolt_database"; then
                 # GC owns canonical metadata/config normalization after this backend
